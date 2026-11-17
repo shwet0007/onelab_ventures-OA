@@ -57,11 +57,11 @@ All records use INR. The reporting interval is October 1–31, 2026, with Novemb
 
 1. Validate schemas, identifiers, dates, types, statuses, currencies, monetary values, signs, uniqueness, and bank arithmetic.
 2. Preserve every bank row and identify additional occurrences of a settlement ID.
-3. Match canonical records by transaction ID, type, currency, and merchant.
-4. Search later available bank data before classifying an October platform record as unmatched.
+3. Match canonical records by transaction ID, type, currency, and merchant, recording the exact bank source row consumed by each one-to-one match. Incompatible or unconsumed bank rows remain visible as exceptions.
+4. Search later available bank data before classifying an October platform record as unmatched, and validate the later settlement's gross, fee, net, type, currency, and merchant before describing it as fully explained.
 5. Verify each bank fee against the valid transaction-level rounding rule, then isolate the legitimate aggregate methodology difference.
 6. Validate refund references independently from financial matching.
-7. Report unmatched and amount/fee mismatch exceptions.
+7. Report unmatched rows, amount/fee mismatches, and additional distinct settlement IDs for an already matched platform transaction.
 
 Malformed records raise clear validation errors and are never silently discarded.
 

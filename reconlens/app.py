@@ -30,9 +30,6 @@ st.caption("Reporting period: October 2026 · Currency: INR · Synthetic assessm
 if not (DATA_DIR / "platform_transactions.csv").exists() or not (DATA_DIR / "bank_settlements.csv").exists():
     generate_data()
 
-if st.button("Run Reconciliation", type="primary"):
-    st.session_state["run_reconciliation"] = True
-
 try:
     platform, bank = load_csvs(str(DATA_DIR / "platform_transactions.csv"), str(DATA_DIR / "bank_settlements.csv"))
     result = reconcile(platform, bank, "2026-10")

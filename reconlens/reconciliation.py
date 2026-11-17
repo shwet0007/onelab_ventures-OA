@@ -76,7 +76,7 @@ def _validate(platform: pd.DataFrame, bank: pd.DataFrame) -> tuple[pd.DataFrame,
         for name in ("gross_amount", "fee_amount", "net_amount"):
             b.at[idx, f"_{name}"] = _decimal(row[name], f"{prefix} {name}", errors)
         if row["transaction_type"] not in VALID_TRANSACTION_TYPES: errors.append(f"{prefix} has invalid transaction_type {row['transaction_type']!r}")
-        if row["currency"] != "INR": errors.append(f"{prefix} must use INR")
+        if pd.isna(row["currency"]) or not str(row["currency"]).strip(): errors.append(f"{prefix} currency is missing")
         gross, fee, net = (b.at[idx, f"_{x}"] for x in ("gross_amount", "fee_amount", "net_amount"))
         if all(isinstance(x, Decimal) for x in (gross, fee, net)):
             if fee < 0: errors.append(f"{prefix} fee_amount must be nonnegative")
@@ -101,6 +101,30 @@ def _exception(kind: str, transaction_id: str = "", settlement_id: str = "", pla
     return result
 
 
+def _expected_amounts(platform_row: pd.Series) -> tuple[Decimal, Decimal, Decimal]:
+    expected_fee_exact = platform_row["_amount"] * FEE_RATE if platform_row["transaction_type"] == "PAYMENT" else Decimal("0")
+    expected_fee_bank = expected_fee_exact.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
+    expected_net_bank = platform_row["_amount"] - expected_fee_bank
+    return expected_fee_exact, expected_fee_bank, expected_net_bank
+
+
+def _amounts_match(platform_row: pd.Series, bank_row: pd.Series) -> bool:
+    _, expected_fee, expected_net = _expected_amounts(platform_row)
+    return (
+        bank_row["_gross_amount"] == platform_row["_amount"]
+        and bank_row["_fee_amount"] == expected_fee
+        and bank_row["_net_amount"] == expected_net
+    )
+
+
+def _identity_matches(platform_row: pd.Series, bank_row: pd.Series) -> bool:
+    return (
+        bank_row["transaction_type"] == platform_row["transaction_type"]
+        and bank_row["currency"] == platform_row["currency"]
+        and bank_row["merchant_id"] == platform_row["merchant_id"]
+    )
+
+
 def reconcile(platform_df: pd.DataFrame, bank_df: pd.DataFrame, reporting_month: str = "2026-10") -> ReconciliationResult:
     p, b = _validate(platform_df, bank_df)
     year, month = map(int, reporting_month.split("-"))
@@ -111,7 +135,6 @@ def reconcile(platform_df: pd.DataFrame, bank_df: pd.DataFrame, reporting_month:
     duplicate_mask = b["settlement_id"].astype(str).duplicated(keep="first")
     duplicate_rows_df = b[duplicate_mask].copy()
     canonical = b[~duplicate_mask].copy()
-    canonical_period = canonical[canonical["_date"].map(in_period)].copy()
     exceptions: list[dict[str, Any]] = []
     duplicate_rows: list[dict[str, Any]] = []
     for _, row in duplicate_rows_df.iterrows():
@@ -123,44 +146,77 @@ def reconcile(platform_df: pd.DataFrame, bank_df: pd.DataFrame, reporting_month:
     bank_by_id: dict[str, list[pd.Series]] = {}
     for _, row in canonical.iterrows(): bank_by_id.setdefault(str(row["transaction_id"]), []).append(row)
     matched: list[str] = []
+    consumed_bank_source_rows: set[int] = set()
+    multiple_settlement_source_rows: set[int] = set()
     cross_adjustment = Decimal("0.00")
     rounding_pairs: list[tuple[Decimal, Decimal]] = []
 
     for transaction_id, prow in p_by_id.items():
-        candidates = [r for r in bank_by_id.get(transaction_id, []) if r["transaction_type"] == prow["transaction_type"] and r["currency"] == prow["currency"] and r["merchant_id"] == prow["merchant_id"]]
+        candidates = [r for r in bank_by_id.get(transaction_id, []) if _identity_matches(prow, r)]
         current = [r for r in candidates if in_period(r["_date"])]
         later = [r for r in candidates if r["_date"] > date(year, month, 1) and not in_period(r["_date"])]
-        expected_fee = prow["_amount"] * FEE_RATE if prow["transaction_type"] == "PAYMENT" else Decimal("0")
-        expected_net_exact = prow["_amount"] - expected_fee
-        if current:
-            brow = current[0]
+        expected_fee_exact, _, expected_net_bank = _expected_amounts(prow)
+
+        # Prefer a correctly valued row, then source order. Any other distinct
+        # settlement ID remains unconsumed and is reported below.
+        eligible = current or later
+        selected = min(eligible, key=lambda r: (not _amounts_match(prow, r), int(r["source_row"]))) if eligible else None
+        if selected is not None:
+            consumed_bank_source_rows.add(int(selected["source_row"]))
             matched.append(transaction_id)
-            valid_bank_fee = expected_fee.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-            gross_match = brow["_gross_amount"] == prow["_amount"]
-            fee_match = brow["_fee_amount"] == valid_bank_fee
-            net_match = brow["_net_amount"] == prow["_amount"] - valid_bank_fee
-            if prow["transaction_type"] == "PAYMENT" and gross_match and fee_match and net_match:
-                rounding_pairs.append((expected_fee, brow["_fee_amount"]))
-            elif not (gross_match and fee_match and net_match):
-                impact = expected_net_exact.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP) - brow["_net_amount"]
-                exceptions.append(_exception("AMOUNT_OR_FEE_MISMATCH", transaction_id, str(brow["settlement_id"]), expected_net_exact.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP), brow["_net_amount"], impact, "Bank gross, fee, or net does not follow the expected transaction-level rule."))
-        elif later:
-            brow = sorted(later, key=lambda r: r["_date"])[0]
-            adjustment = -expected_net_exact.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
-            cross_adjustment += adjustment
-            exceptions.append(_exception("CROSS_MONTH_SETTLEMENT", transaction_id, str(brow["settlement_id"]), -adjustment, brow["_net_amount"], adjustment, "Payment was processed in October but settled in a later month. This explains a timing difference.", "EXPLAINED", "Monitor settlement timing; no amount correction is required."))
+            amount_match = _amounts_match(prow, selected)
+            if in_period(selected["_date"]):
+                if prow["transaction_type"] == "PAYMENT" and amount_match:
+                    rounding_pairs.append((expected_fee_exact, selected["_fee_amount"]))
+                elif not amount_match:
+                    impact = expected_net_bank - selected["_net_amount"]
+                    exceptions.append(_exception("AMOUNT_OR_FEE_MISMATCH", transaction_id, str(selected["settlement_id"]), expected_net_bank, selected["_net_amount"], impact, "Bank gross, fee, or net does not follow the expected transaction-level rule.", amount_difference=impact))
+            else:
+                adjustment = -expected_net_bank
+                cross_adjustment += adjustment
+                if amount_match:
+                    explanation = "Payment was processed in October and validly settled in a later month. This explains a timing difference."
+                    status = "EXPLAINED"
+                    action = "Monitor settlement timing; no amount correction is required."
+                else:
+                    explanation = "Payment was processed in October and appears in a later month, but the later settlement values do not reconcile. The timing adjustment remains valid; the settlement amount requires review."
+                    status = "REQUIRES_REVIEW"
+                    action = "Investigate and correct the later-period settlement values."
+                exceptions.append(_exception("CROSS_MONTH_SETTLEMENT", transaction_id, str(selected["settlement_id"]), expected_net_bank, selected["_net_amount"], adjustment, explanation, status, action))
+                if not amount_match:
+                    amount_difference = expected_net_bank - selected["_net_amount"]
+                    exceptions.append(_exception("AMOUNT_OR_FEE_MISMATCH", transaction_id, str(selected["settlement_id"]), expected_net_bank, selected["_net_amount"], Decimal("0.00"), "The later-period settlement gross, fee, or net does not follow the expected transaction-level rule. It does not change the October raw bank total.", amount_difference=amount_difference))
         else:
-            exceptions.append(_exception("UNMATCHED_PLATFORM_TRANSACTION", transaction_id, platform_amount=expected_net_exact.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP), financial_impact=expected_net_exact.quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP), explanation="No matching bank settlement was found in October or the available later data."))
+            exceptions.append(_exception("UNMATCHED_PLATFORM_TRANSACTION", transaction_id, platform_amount=expected_net_bank, financial_impact=expected_net_bank, explanation="No bank record with matching transaction type, currency, and merchant was found in October or the available later data."))
+
+        if selected is not None:
+            for extra in candidates:
+                extra_source_row = int(extra["source_row"])
+                if extra_source_row == int(selected["source_row"]):
+                    continue
+                multiple_settlement_source_rows.add(extra_source_row)
+                impact = -extra["_net_amount"] if in_period(extra["_date"]) else Decimal("0.00")
+                exceptions.append(_exception("MULTIPLE_BANK_SETTLEMENTS", transaction_id, str(extra["settlement_id"]), expected_net_bank, extra["_net_amount"], impact, "A distinct additional settlement ID references a platform transaction that already consumed another bank settlement. The additional row is preserved but not treated as a valid one-to-one match.", action="Determine whether the additional settlement is a correction, reversal, or duplicate transfer.", source_row=int(extra["source_row"])))
 
         if prow["transaction_type"] == "REFUND":
             original = str(prow["original_transaction_id"]).strip()
             original_exists = original in set(p["transaction_id"].astype(str)) and any((p["transaction_id"].astype(str) == original) & (p["transaction_type"] == "PAYMENT"))
             if not original_exists:
-                exceptions.append(_exception("ORPHAN_REFUND", transaction_id, platform_amount=prow["_amount"], bank_amount=current[0]["_net_amount"] if current else None, financial_impact=Decimal("0.00"), explanation="The refund matches financially but references an original payment missing from the available platform records.", action="Verify the original payment in historical records before approving the refund."))
+                exceptions.append(_exception("ORPHAN_REFUND", transaction_id, platform_amount=prow["_amount"], bank_amount=selected["_net_amount"] if selected is not None else None, financial_impact=Decimal("0.00"), explanation="The refund matches financially but references an original payment missing from the available platform records.", action="Verify the original payment in historical records before approving the refund."))
 
-    for _, brow in canonical_period.iterrows():
-        if str(brow["transaction_id"]) not in p_by_id:
-            exceptions.append(_exception("UNMATCHED_BANK_SETTLEMENT", str(brow["transaction_id"]), str(brow["settlement_id"]), bank_amount=brow["_net_amount"], financial_impact=-brow["_net_amount"], explanation="October bank settlement has no matching platform transaction."))
+    for _, brow in canonical.iterrows():
+        bank_source_row = int(brow["source_row"])
+        if bank_source_row in consumed_bank_source_rows or bank_source_row in multiple_settlement_source_rows:
+            continue
+        in_reporting_period = in_period(brow["_date"])
+        impact = -brow["_net_amount"] if in_reporting_period else Decimal("0.00")
+        platform_row = p_by_id.get(str(brow["transaction_id"]))
+        if platform_row is None:
+            explanation = "Bank settlement has no matching platform transaction."
+        else:
+            mismatched_fields = [name for name in ("transaction_type", "currency", "merchant_id") if brow[name] != platform_row[name]]
+            explanation = f"Bank settlement was not consumed because it differs from the platform record on: {', '.join(mismatched_fields)}." if mismatched_fields else "Bank settlement was not consumed by a valid one-to-one reconciliation match."
+        exceptions.append(_exception("UNMATCHED_BANK_SETTLEMENT", str(brow["transaction_id"]), str(brow["settlement_id"]), bank_amount=brow["_net_amount"], financial_impact=impact, explanation=explanation, source_row=int(brow["source_row"])))
 
     exact_fee_total = sum((fee for fee, _ in rounding_pairs), Decimal("0")).quantize(MONEY_QUANTUM, rounding=ROUND_HALF_UP)
     bank_fee_total = sum((fee for _, fee in rounding_pairs), Decimal("0.00"))
